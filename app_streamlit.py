@@ -1,127 +1,127 @@
+# app_streamlit.py
+# Vinitud Cutout Tool — white background -> transparent PNG 2000x2000, bottle ~72%
+# NO OpenCV (cv2). Uses only Pillow + numpy so it works on Streamlit Cloud.
+
 import io
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(
-    page_title="Vinitud Cutout Tool",
-    page_icon="🍾",
-    layout="centered",
-)
-
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# =========================
-# UTILS
-# =========================
+# ----------------------------
+# Helpers
+# ----------------------------
 def slugify(text: str) -> str:
     text = (text or "").strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
     return text or "vinitud"
 
 
-def pil_to_bytes(pil_img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def ensure_rgba(pil_img: Image.Image) -> Image.Image:
-    if pil_img.mode != "RGBA":
-        return pil_img.convert("RGBA")
-    return pil_img
-
-
-def process_cutout(
-    uploaded_file,
-    white_threshold: int = 220,
-    edge_softness: int = 3,
-    out_size: int = 2000,
-) -> Image.Image:
+def remove_white_bg_rgba(img_rgba: Image.Image, threshold: int, feather: int) -> Image.Image:
     """
-    Assunzione: input con sfondo bianco (o quasi).
-    Crea maschera alpha basata su soglia del bianco + morbidezza bordi.
-    Output: PNG RGBA 2000x2000 con trasparenza.
+    Build alpha mask: pixels close to white become transparent.
+    threshold: 0..255 (higher => removes more)
+    feather:   0..30 approx (soft edge)
     """
-    # Leggi bytes -> OpenCV BGR
-    file_bytes = np.frombuffer(uploaded_file.getvalue(), dtype=np.uint8)
-    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise ValueError("Immagine non valida o non leggibile.")
+    arr = np.array(img_rgba).astype(np.uint8)  # (H,W,4)
+    rgb = arr[..., :3].astype(np.int16)
 
-    # Converti in RGB
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # "whiteness" as minimum channel value (conservative): if min channel is high, it's white-ish
+    whiteness = np.min(rgb, axis=2)  # 0..255
 
-    # Calcola "quanto è bianco" un pixel (max su canali o min su canali)
-    # Usiamo min(R,G,B): se min è alto, pixel è vicino al bianco
-    min_rgb = np.min(rgb, axis=2)
+    # mask_foreground: 1 where NOT white (keep), 0 where white (remove)
+    mask_fg = (whiteness < threshold).astype(np.uint8) * 255  # 0/255
 
-    # Maschera: dove NON è bianco -> oggetto
-    # Oggetto = min_rgb < white_threshold
-    mask = (min_rgb < white_threshold).astype(np.uint8) * 255
+    mask_img = Image.fromarray(mask_fg, mode="L")
 
-    # Pulizia maschera (morph)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    if feather and feather > 0:
+        # blur the mask edges for smoother transparency
+        mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=float(feather)))
 
-    # Morbidezza bordo
-    if edge_softness and edge_softness > 0:
-        k = int(edge_softness) * 2 + 1  # kernel dispari
-        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    out = img_rgba.copy()
+    out.putalpha(mask_img)
+    return out
 
-    # Crea RGBA: RGB + alpha(mask)
-    rgba = cv2.cvtColor(rgb, cv2.COLOR_RGB2RGBA)
-    rgba[:, :, 3] = mask
 
-    # Converti a PIL
-    out = Image.fromarray(rgba, mode="RGBA")
+def compose_2000_square(subject_rgba: Image.Image, target_size: int = 2000, subject_height_ratio: float = 0.72) -> Image.Image:
+    """
+    Centers the subject on a transparent 2000x2000 canvas, scaling it
+    so its height is ~72% of the canvas.
+    """
+    canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
 
-    # Resize su canvas 2000x2000 mantenendo proporzioni + centratura
-    # Prima: scala per entrare in out_size (con un po' di margine)
-    target = out_size
-    margin = int(target * 0.08)  # 8% margine
-    max_w = target - margin * 2
-    max_h = target - margin * 2
+    # bounding box of non-transparent pixels
+    alpha = np.array(subject_rgba.getchannel("A"))
+    ys, xs = np.where(alpha > 5)
+    if len(xs) == 0 or len(ys) == 0:
+        return canvas  # nothing detected
 
-    w, h = out.size
-    scale = min(max_w / w, max_h / h)
+    left, right = xs.min(), xs.max()
+    top, bottom = ys.min(), ys.max()
+    cropped = subject_rgba.crop((left, top, right + 1, bottom + 1))
+
+    # scale to target height ratio
+    target_h = int(target_size * subject_height_ratio)
+    w, h = cropped.size
+    if h <= 0:
+        return canvas
+
+    scale = target_h / h
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
-    out_resized = out.resize((new_w, new_h), Image.LANCZOS)
 
-    canvas = Image.new("RGBA", (target, target), (0, 0, 0, 0))
-    x = (target - new_w) // 2
-    y = (target - new_h) // 2
-    canvas.paste(out_resized, (x, y), out_resized)
+    resized = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
+    x = (target_size - new_w) // 2
+    y = (target_size - new_h) // 2
+    canvas.paste(resized, (x, y), resized)
     return canvas
 
 
-# =========================
+def try_save_local(png_bytes: bytes, filename: str) -> str | None:
+    """
+    Optional: if running locally, save a copy to ~/VinitudCutout_Output.
+    On Streamlit Cloud it may fail (read-only). We just ignore failures.
+    """
+    try:
+        out_dir = Path.home() / "VinitudCutout_Output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / filename
+        out_path.write_bytes(png_bytes)
+        return str(out_path)
+    except Exception:
+        return None
+
+
+# ----------------------------
 # UI
-# =========================
+# ----------------------------
+st.set_page_config(page_title="Vinitud Cutout Tool", layout="wide")
+
 st.title("Vinitud Cutout Tool")
-st.caption("Sfondo bianco → PNG trasparente 2000×2000, bottiglia ~72% (cloud).")
+st.caption("Sfondo bianco → PNG trasparente 2000×2000, bottiglia ~72% (cloud / locale).")
 
-col_out, col_in = st.columns([3, 1.6], gap="large")
+# Keep output stable until user clicks "Genera output"
+if "last_output_bytes" not in st.session_state:
+    st.session_state.last_output_bytes = None
+if "last_filename" not in st.session_state:
+    st.session_state.last_filename = None
+if "last_saved_path" not in st.session_state:
+    st.session_state.last_saved_path = None
 
-with col_in:
+# Layout: LEFT narrow input, RIGHT wide output
+col_left, col_right = st.columns([1, 2.2], gap="large")
+
+with col_left:
     st.subheader("Input")
 
-    uploaded_file = st.file_uploader(
+    uploaded = st.file_uploader(
         "Carica immagine (sfondo bianco)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=False,
@@ -131,71 +131,69 @@ with col_in:
     prodotto = st.text_input("Prodotto", value="")
     anno = st.text_input("Anno", value="")
 
-    white_threshold = st.slider(
-        "Soglia bianco",
-        min_value=200,
-        max_value=255,
-        value=220,
-        help="Più basso = togli più sfondo (attenzione a perdere dettagli chiari).",
-    )
+    threshold = st.slider("Soglia bianco", min_value=200, max_value=255, value=214, step=1, help="Più alto = rimuove più bianco.")
+    feather = st.slider("Morbidezza bordo", min_value=0, max_value=15, value=3, step=1, help="Sfuma leggermente il bordo della trasparenza.")
 
-    edge_softness = st.slider(
-        "Morbidezza bordo",
-        min_value=0,
-        max_value=15,
-        value=3,
-        help="Aumenta per bordi più soft. 0 = bordi netti.",
-    )
+    st.divider()
 
-    genera = st.button("Genera output", type="primary", use_container_width=True)
+    # Preview input (under controls)
+    if uploaded:
+        try:
+            input_img = Image.open(uploaded).convert("RGBA")
+            st.caption("Preview input")
+            st.image(input_img, width=260)
+        except Exception as e:
+            st.error(f"Impossibile leggere l'immagine: {e}")
+            input_img = None
+    else:
+        input_img = None
+        st.info("Carica una foto per iniziare.")
 
-    if uploaded_file:
-        st.divider()
-        st.caption("Preview input")
-        st.image(uploaded_file, width=260)
+    generate = st.button("Genera output", type="primary", use_container_width=True, disabled=(input_img is None))
 
-with col_out:
+with col_right:
     st.subheader("Output")
 
-    if not uploaded_file:
-        st.info("Carica una foto per iniziare.")
-    else:
-        if genera:
-            try:
-                out_img = process_cutout(
-                    uploaded_file=uploaded_file,
-                    white_threshold=white_threshold,
-                    edge_softness=edge_softness,
-                    out_size=2000,
-                )
+    if generate and input_img is not None:
+        # 1) Remove white bg
+        cut = remove_white_bg_rgba(input_img, threshold=threshold, feather=feather)
 
-                # Nome file “pulito”
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fname = f"{slugify(brand)}_{slugify(prodotto)}_{slugify(anno)}_{ts}.png"
-                fname = fname.replace("__", "_").strip("_")
-                if fname.startswith("_"):
-                    fname = fname[1:]
+        # 2) Compose 2000x2000 with ~72% subject
+        out_img = compose_2000_square(cut, target_size=2000, subject_height_ratio=0.72)
 
-                # Salva su disco (utile in locale). In Streamlit Cloud resta nel container.
-                out_path = OUTPUT_DIR / fname
-                out_img.save(out_path, format="PNG")
+        # 3) Build filename
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"{slugify(brand)}_{slugify(prodotto)}_{slugify(anno)}_{stamp}.png"
 
-                # Mostra output non gigante
-                st.image(out_img, caption="PNG trasparente 2000×2000", width=420)
+        # 4) PNG bytes
+        buf = io.BytesIO()
+        out_img.save(buf, format="PNG", optimize=True)
+        png_bytes = buf.getvalue()
 
-                # Download (questo è quello che conta per il cliente)
-                st.download_button(
-                    "Scarica PNG",
-                    data=pil_to_bytes(out_img),
-                    file_name=fname,
-                    mime="image/png",
-                    use_container_width=False,
-                )
+        # 5) Store in session (so it stays visible if user changes sliders)
+        st.session_state.last_output_bytes = png_bytes
+        st.session_state.last_filename = fname
+        st.session_state.last_saved_path = try_save_local(png_bytes, fname)
 
-                st.caption(f"File generato: `{fname}`")
+    # Render last output if present
+    if st.session_state.last_output_bytes:
+        out_preview = Image.open(io.BytesIO(st.session_state.last_output_bytes)).convert("RGBA")
 
-            except Exception as e:
-                st.error(f"Errore durante la generazione: {e}")
+        # Output preview size (not giant)
+        st.image(out_preview, width=520)
 
+        st.caption("PNG trasparente 2000×2000")
+
+        st.download_button(
+            label="Scarica PNG",
+            data=st.session_state.last_output_bytes,
+            file_name=st.session_state.last_filename or "vinitud_output.png",
+            mime="image/png",
+        )
+
+        if st.session_state.last_saved_path:
+            st.caption(f"Salvato anche in locale: {st.session_state.last_saved_path}")
         else:
-            st.warning("Regola i parametri e premi **Genera output**.")
+            st.caption("Nota: su Streamlit Cloud il file non viene salvato su disco (scaricalo con il pulsante).")
+    else:
+        st.info("Carica un’immagine e clicca **Genera output**.")
