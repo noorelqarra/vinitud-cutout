@@ -1,181 +1,172 @@
 import re
-from datetime import datetime
+from collections import deque
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-import streamlit as st
 from PIL import Image, ImageFilter
-
-# OpenCV headless (serve per floodFill robusto)
-import cv2
+import streamlit as st
 
 
 # -------------------------
-# Utility
+# Helpers
 # -------------------------
-def slugify(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    text = text.replace(" ", "_")
-    text = re.sub(r"[^a-zA-Z0-9_\-]+", "", text)
-    text = re.sub(r"_+", "_", text)
-    return text.strip("_")
+
+def slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = (
+        s.replace("à", "a").replace("è", "e").replace("é", "e")
+        .replace("ì", "i").replace("ò", "o").replace("ù", "u")
+    )
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
 
 
 def build_filename(brand: str, prodotto: str, anno: str) -> str:
-    b = slugify(brand) or "brand"
-    p = slugify(prodotto) or "prodotto"
-    a = slugify(anno) or "anno"
-    return f"{b}_{p}_{a}.png"
+    b = slugify(brand)
+    p = slugify(prodotto)
+    a = slugify(str(anno))
+    parts = [x for x in [b, p, a] if x]
+    if not parts:
+        parts = ["output"]
+    return "_".join(parts) + ".png"
 
 
-def ensure_unique_path(path: Path) -> Path:
-    """Evita overwrite in locale: brand_prod_anno.png, brand_prod_anno_2.png, ..."""
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    i = 2
-    while True:
-        candidate = path.with_name(f"{stem}_{i}{suffix}")
-        if not candidate.exists():
-            return candidate
-        i += 1
-
-
-# -------------------------
-# Core: background removal robusto
-# -------------------------
-def remove_white_background_floodfill(
-    rgb: np.ndarray,
-    white_thr: int = 220,
-    chroma_thr: int = 28,
-) -> np.ndarray:
+def _flood_fill_background(bg_candidate: np.ndarray) -> np.ndarray:
     """
-    Rimuove SOLO il bianco collegato ai bordi (sfondo),
-    così etichette chiare / riflessi interni non vengono tagliati.
-
-    rgb: HxWx3 uint8
-    return: alpha HxW uint8 (255 foreground, 0 background)
+    bg_candidate: boolean mask True where pixel is "near white"
+    Returns: boolean mask True where pixel is REAL background (near-white AND connected to borders)
     """
-    r = rgb[:, :, 0].astype(np.int16)
-    g = rgb[:, :, 1].astype(np.int16)
-    b = rgb[:, :, 2].astype(np.int16)
+    h, w = bg_candidate.shape
+    visited = np.zeros((h, w), dtype=bool)
+    q = deque()
 
-    mn = np.minimum(np.minimum(r, g), b)
-    mx = np.maximum(np.maximum(r, g), b)
+    # enqueue border pixels that are candidates
+    def push(y, x):
+        if 0 <= y < h and 0 <= x < w and (not visited[y, x]) and bg_candidate[y, x]:
+            visited[y, x] = True
+            q.append((y, x))
 
-    # Candidato sfondo: molto chiaro + poco "colorato" (quasi neutro)
-    bg_candidate = (mn >= white_thr) & ((mx - mn) <= chroma_thr)
-    bg_u8 = (bg_candidate.astype(np.uint8) * 255)
+    # top & bottom rows
+    for x in range(w):
+        push(0, x)
+        push(h - 1, x)
+    # left & right cols
+    for y in range(h):
+        push(y, 0)
+        push(y, w - 1)
 
-    h, w = bg_u8.shape
+    # BFS 4-neighborhood
+    while q:
+        y, x = q.popleft()
+        if y > 0: push(y - 1, x)
+        if y < h - 1: push(y + 1, x)
+        if x > 0: push(y, x - 1)
+        if x < w - 1: push(y, x + 1)
 
-    # Flood fill su maschera: riempiamo SOLO le aree bg_candidate connesse ai bordi
-    # cv2.floodFill richiede una mask più grande di 2 px
-    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-
-    filled = bg_u8.copy()
-
-    # Prova 4 angoli (se l’immagine ha margini strani)
-    seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
-    for x, y in seeds:
-        if filled[y, x] == 255:
-            cv2.floodFill(filled, flood_mask, (x, y), 128)
-
-    # Background reale = 128 (riempito) + eventuale bianco rimasto sui bordi
-    bg_connected = (filled == 128)
-
-    alpha = np.where(bg_connected, 0, 255).astype(np.uint8)
-    return alpha
-
-
-def feather_alpha(alpha: np.ndarray, radius: int) -> np.ndarray:
-    if radius <= 0:
-        return alpha
-    a = Image.fromarray(alpha, mode="L")
-    a = a.filter(ImageFilter.GaussianBlur(radius=float(radius)))
-    return np.array(a, dtype=np.uint8)
+    # visited == background connected to edges
+    return visited
 
 
-def compose_2000_canvas(rgba: np.ndarray, target_size: int = 2000, bottle_ratio: float = 0.72) -> Image.Image:
+def remove_white_background_rgba(
+    img_rgb: Image.Image,
+    white_threshold: int,
+    feather_px: int,
+    downscale_max: int = 900,
+) -> Image.Image:
     """
-    Nessun autocrop: prende l'oggetto con trasparenza e lo ridimensiona
-    su canvas 2000x2000.
-    bottle_ratio = altezza oggetto rispetto al canvas (es. 0.72 = 72%)
+    Robust background removal:
+    1) detect near-white pixels
+    2) mark as background only those near-white pixels connected to image borders
+    This prevents eating white labels/reflections on the bottle.
     """
-    img = Image.fromarray(rgba, mode="RGBA")
+    img_rgb = img_rgb.convert("RGB")
+    w0, h0 = img_rgb.size
 
-    # bounding box dell’alpha (solo per capire dimensioni oggetto)
-    alpha = np.array(img.split()[-1])
-    ys, xs = np.where(alpha > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        # niente foreground -> ritorna canvas trasparente
-        return Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
+    # downscale for flood-fill speed (then upscale mask)
+    scale = min(1.0, downscale_max / max(w0, h0))
+    if scale < 1.0:
+        w1, h1 = int(w0 * scale), int(h0 * scale)
+        small = img_rgb.resize((w1, h1), Image.Resampling.BILINEAR)
+    else:
+        small = img_rgb
+        w1, h1 = w0, h0
 
-    # Crop SOLO per calcolare il ridimensionamento dell'oggetto (non è "autocrop finale")
-    # serve a evitare di scalare anche tutta l'area vuota.
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
-    obj = img.crop((x0, y0, x1 + 1, y1 + 1))
+    arr = np.asarray(small).astype(np.uint8)
 
-    target_h = int(target_size * bottle_ratio)
-    scale = target_h / max(1, obj.size[1])
-    target_w = max(1, int(obj.size[0] * scale))
+    # "near white" candidate: all channels above threshold
+    bg_candidate = (arr[:, :, 0] > white_threshold) & (arr[:, :, 1] > white_threshold) & (arr[:, :, 2] > white_threshold)
 
-    obj_resized = obj.resize((target_w, target_h), resample=Image.LANCZOS)
+    # flood fill from borders to keep only real background
+    bg_real_small = _flood_fill_background(bg_candidate)
 
-    canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
-    x = (target_size - target_w) // 2
-    y = (target_size - target_h) // 2
-    canvas.alpha_composite(obj_resized, (x, y))
+    # convert to alpha: background -> 0, else -> 255
+    alpha_small = np.where(bg_real_small, 0, 255).astype(np.uint8)
+    alpha_img_small = Image.fromarray(alpha_small, mode="L")
+
+    # upscale alpha mask back to original size
+    if (w1, h1) != (w0, h0):
+        alpha_img = alpha_img_small.resize((w0, h0), Image.Resampling.BILINEAR)
+    else:
+        alpha_img = alpha_img_small
+
+    # feather edge
+    if feather_px > 0:
+        alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(radius=int(feather_px)))
+
+    rgba = img_rgb.convert("RGBA")
+    rgba.putalpha(alpha_img)
+    return rgba
+
+
+def compose_on_canvas(
+    rgba: Image.Image,
+    canvas_size: int = 2000,
+    target_height_ratio: float = 0.72,
+) -> Image.Image:
+    """
+    NO autocrop: keep original proportions, scale by height ratio, center on 2000x2000 transparent canvas.
+    """
+    w, h = rgba.size
+    target_h = int(canvas_size * target_height_ratio)
+
+    scale = target_h / float(h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    resized = rgba.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    x = (canvas_size - new_w) // 2
+    y = (canvas_size - new_h) // 2
+    canvas.paste(resized, (x, y), resized)
     return canvas
 
 
-def process_image(
-    pil_img: Image.Image,
-    white_thr: int,
-    feather: int,
-    chroma_thr: int = 28,
-) -> Image.Image:
-    # converti in RGB
-    rgb_img = pil_img.convert("RGB")
-    rgb = np.array(rgb_img, dtype=np.uint8)
-
-    # alpha robusto
-    alpha = remove_white_background_floodfill(rgb, white_thr=white_thr, chroma_thr=chroma_thr)
-
-    # feather bordi
-    alpha = feather_alpha(alpha, feather)
-
-    rgba = np.dstack([rgb, alpha]).astype(np.uint8)
-
-    # canvas finale 2000x2000, bottiglia ~72%
-    out = compose_2000_canvas(rgba, target_size=2000, bottle_ratio=0.72)
-    return out
+def pil_to_png_bytes(img: Image.Image) -> bytes:
+    bio = BytesIO()
+    img.save(bio, format="PNG", optimize=True)
+    return bio.getvalue()
 
 
 # -------------------------
 # Streamlit UI
 # -------------------------
+
 st.set_page_config(page_title="Vinitud Cutout Tool", layout="wide")
 
 st.title("🍾 Vinitud Cutout Tool")
-st.caption("Sfondo bianco → PNG trasparente 2000×2000, bottiglia ~72% (cloud / locale).")
+st.caption("Sfondo bianco → PNG trasparente 2000×2000, bottiglia ~72% (fix etichette chiare).")
 
-# Stato
-if "out_img" not in st.session_state:
-    st.session_state.out_img = None
-if "out_bytes" not in st.session_state:
-    st.session_state.out_bytes = None
-if "saved_path" not in st.session_state:
-    st.session_state.saved_path = None
-if "last_filename" not in st.session_state:
-    st.session_state.last_filename = None
+if "out_png" not in st.session_state:
+    st.session_state.out_png = None
+if "out_filename" not in st.session_state:
+    st.session_state.out_filename = None
+if "out_path" not in st.session_state:
+    st.session_state.out_path = None
 
-# Layout: sinistra stretta, destra output
-left, right = st.columns([1, 2.2], gap="large")
+left, right = st.columns([1, 2], gap="large")
 
 with left:
     st.subheader("Input")
@@ -183,86 +174,77 @@ with left:
     uploaded = st.file_uploader(
         "Carica immagine (sfondo bianco)",
         type=["png", "jpg", "jpeg"],
-        accept_multiple_files=False,
     )
 
-    brand = st.text_input("Brand", value="")
-    prodotto = st.text_input("Prodotto", value="")
-    anno = st.text_input("Anno", value="")
+    brand = st.text_input("Brand")
+    prodotto = st.text_input("Prodotto")
+    anno = st.text_input("Anno")
 
-    white_thr = st.slider("Soglia bianco", min_value=200, max_value=255, value=220, step=1)
-    feather = st.slider("Morbidezza bordo", min_value=0, max_value=15, value=3, step=1)
+    white_threshold = st.slider("Soglia bianco", 200, 255, 232, 1)
+    feather_px = st.slider("Morbidezza bordo", 0, 20, 3, 1)
+    target_ratio = st.slider("Dimensione bottiglia (altezza su 2000px)", 0.55, 0.85, 0.72, 0.01)
 
-    st.divider()
-    st.caption("Preview input (piccolo)")
+    st.markdown("---")
+    generate = st.button("Genera output", type="primary", use_container_width=True)
 
+    st.markdown("**Preview input**")
     if uploaded:
-        pil_in = Image.open(uploaded)
-        st.image(pil_in, caption="Input", use_container_width=True)
+        img_preview = Image.open(uploaded).convert("RGB")
+        thumb = img_preview.copy()
+        thumb.thumbnail((520, 520))
+        st.image(thumb, width=320)
     else:
-        pil_in = None
         st.info("Carica una foto per iniziare.")
-
-    st.divider()
-
-    # Bottone sempre visibile (stabile) con form
-    with st.form("generate_form", clear_on_submit=False):
-        submitted = st.form_submit_button("Genera output", use_container_width=True)
-
-    if submitted:
-        if pil_in is None:
-            st.error("Carica prima un’immagine.")
-        else:
-            try:
-                out = process_image(pil_in, white_thr=white_thr, feather=feather)
-
-                # bytes per download
-                buf = np.frombuffer(b"", dtype=np.uint8)  # placeholder
-                import io
-                bio = io.BytesIO()
-                out.save(bio, format="PNG", optimize=True)
-                out_bytes = bio.getvalue()
-
-                filename = build_filename(brand, prodotto, anno)
-
-                # salva anche in locale (su cloud è un disco temporaneo: non lo “vedi” nel tuo PC)
-                out_dir = Path.home() / "VinitudCutout_Output"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = ensure_unique_path(out_dir / filename)
-                out.save(out_path)
-
-                st.session_state.out_img = out
-                st.session_state.out_bytes = out_bytes
-                st.session_state.saved_path = str(out_path)
-                st.session_state.last_filename = out_path.name
-
-                st.success("Output generato ✅")
-
-            except Exception as e:
-                st.session_state.out_img = None
-                st.session_state.out_bytes = None
-                st.session_state.saved_path = None
-                st.session_state.last_filename = None
-                st.error(f"Errore in elaborazione: {e}")
 
 with right:
     st.subheader("Output")
 
-    if st.session_state.out_img is None:
-        st.info("Genera un output per vedere il PNG trasparente.")
-    else:
-        # Output non gigante: limitiamo la larghezza dentro la colonna
-        st.image(st.session_state.out_img, caption="PNG trasparente 2000×2000", width=520)
+    if generate:
+        if uploaded is None:
+            st.error("Carica un'immagine prima.")
+        else:
+            img_in = Image.open(uploaded).convert("RGB")
+
+            rgba = remove_white_background_rgba(
+                img_rgb=img_in,
+                white_threshold=int(white_threshold),
+                feather_px=int(feather_px),
+                downscale_max=900,
+            )
+
+            canvas = compose_on_canvas(
+                rgba=rgba,
+                canvas_size=2000,
+                target_height_ratio=float(target_ratio),
+            )
+
+            filename = build_filename(brand, prodotto, anno)
+            png_bytes = pil_to_png_bytes(canvas)
+
+            out_dir = Path.home() / "VinitudCutout_Output"
+            out_dir.mkdir(exist_ok=True)
+
+            out_path = out_dir / filename
+            out_path.write_bytes(png_bytes)  # sovrascrive come richiesto
+
+            st.session_state.out_png = png_bytes
+            st.session_state.out_filename = filename
+            st.session_state.out_path = str(out_path)
+
+    if st.session_state.out_png:
+        out_img = Image.open(BytesIO(st.session_state.out_png)).convert("RGBA")
+
+        st.image(out_img, width=520)
+        st.caption("PNG trasparente 2000×2000")
 
         st.download_button(
-            label="Scarica PNG",
-            data=st.session_state.out_bytes,
-            file_name=st.session_state.last_filename or "output.png",
+            "Scarica PNG",
+            data=st.session_state.out_png,
+            file_name=st.session_state.out_filename,
             mime="image/png",
         )
 
-        st.caption(
-            f"Salvataggio server: `{st.session_state.saved_path}`\n\n"
-            "Nota: su Streamlit Cloud questo percorso è nel server (non nel tuo computer). "
-            "Per averlo sul PC usa **Scarica PNG**."
-        )
+        st.caption(f"Salvato anche in locale: `{st.session_state.out_path}`")
+        st.caption("Nota: su Streamlit Cloud il salvataggio su disco è temporaneo. Conta il download.")
+    else:
+        st.info("Genera un output per vederlo qui.")
