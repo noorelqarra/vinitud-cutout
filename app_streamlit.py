@@ -1,117 +1,108 @@
-import cv2
-import numpy as np
-from PIL import Image
-from pathlib import Path
-import unicodedata
-import re
 import streamlit as st
-import io
+import numpy as np
+from PIL import Image, ImageFilter
+from pathlib import Path
 
-CANVAS_SIZE = 2000
-TARGET_RATIO = 0.72
+st.set_page_config(page_title="Vinitud Cutout Tool", layout="centered")
 
-OUTPUT_DIR = Path.home() / "VinitudCutout_Output"
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-def slugify(text: str) -> str:
-    text = (text or "").strip()
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
-    text = text.lower()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_-]+", "-", text).strip("-")
-    return text if text else "product"
-
-def remove_white_background(img: Image.Image, threshold: int, softness: int) -> Image.Image:
-    img_np = np.array(img.convert("RGBA"))
-    rgb = img_np[..., :3]
-    alpha = img_np[..., 3]
-
-    # consider background as near-white
-    white_mask = np.all(rgb > threshold, axis=2)
-
-    alpha_new = alpha.copy()
-    alpha_new[white_mask] = 0
-
-    # soften edges (helps halos and light shadows)
-    blur = cv2.GaussianBlur(alpha_new, (0, 0), softness)
-    img_np[..., 3] = blur
-
-    return Image.fromarray(img_np)
-
-def bbox_from_alpha(img: Image.Image):
-    alpha = np.array(img)[..., 3]
-    ys, xs = np.where(alpha > 10)
-    if len(xs) == 0:
-        return None
-    return xs.min(), ys.min(), xs.max(), ys.max()
-
-def normalize_canvas(img: Image.Image) -> Image.Image:
-    bbox = bbox_from_alpha(img)
-    if not bbox:
-        return img
-
-    x1, y1, x2, y2 = bbox
-    crop = img.crop((x1, y1, x2 + 1, y2 + 1))
-
-    w, h = crop.size
-    target_h = int(CANVAS_SIZE * TARGET_RATIO)
-    scale = target_h / h
-
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-
-    resized = crop.resize((new_w, new_h), Image.LANCZOS)
-
-    canvas = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
-    left = (CANVAS_SIZE - new_w) // 2
-    top = (CANVAS_SIZE - new_h) // 2
-    canvas.paste(resized, (left, top), resized)
-    return canvas
-
-def process(img: Image.Image, brand: str, product: str, year: str, threshold: int, softness: int):
-    cutout = remove_white_background(img, threshold, softness)
-    final = normalize_canvas(cutout)
-
-    filename = f"{slugify(brand)}-{slugify(product)}-{slugify(year)}-transparent-2000.png"
-    save_path = OUTPUT_DIR / filename
-    final.save(save_path, "PNG")
-
-    buf = io.BytesIO()
-    final.save(buf, format="PNG")
-    buf.seek(0)
-    return final, filename, save_path, buf
-
-st.set_page_config(page_title="Vinitud Cutout", layout="centered")
 st.title("🍾 Vinitud Cutout Tool")
 st.caption("Sfondo bianco → PNG trasparente 2000×2000, bottiglia al 72% (locale, gratuito).")
 
-uploaded = st.file_uploader("Carica un'immagine (sfondo bianco)", type=["png", "jpg", "jpeg"])
+uploaded = st.file_uploader(
+    "Carica un'immagine (sfondo bianco)",
+    type=["png", "jpg", "jpeg"]
+)
 
 col1, col2, col3 = st.columns(3)
-with col1:
-    brand = st.text_input("Brand", "")
-with col2:
-    product = st.text_input("Prodotto", "")
-with col3:
-    year = st.text_input("Anno", "")
+brand = col1.text_input("Brand")
+prodotto = col2.text_input("Prodotto")
+anno = col3.text_input("Anno")
 
-threshold = st.slider("Soglia bianco", 200, 255, 240, 1)
-softness = st.slider("Morbidezza bordo", 1, 25, 8, 1)
+threshold = st.slider("Soglia bianco", 200, 255, 240)
+soft = st.slider("Morbidezza bordo", 0, 20, 8)
 
-if uploaded:
-    img = Image.open(uploaded).convert("RGBA")
-    st.image(img, caption="Input", use_container_width=True)
+OUTPUT_DIR = Path.home() / "VinitudCutout_Output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if st.button("Processa"):
-        final, filename, save_path, buf = process(img, brand, product, year, threshold, softness)
-        st.success(f"Fatto! Salvato in: {save_path}")
-        st.image(final, caption="Output (trasparente)", use_container_width=True)
+def cutout_white_bg_pillow(img: Image.Image, thr: int, soften: int) -> Image.Image:
+    # Ensure RGB
+    img = img.convert("RGB")
+    arr = np.array(img).astype(np.uint8)
 
-        st.download_button(
-            label="Scarica PNG",
-            data=buf,
-            file_name=filename,
-            mime="image/png",
-        )
-else:
+    # White mask: pixel considered background if ALL channels >= threshold
+    bg = (arr[:, :, 0] >= thr) & (arr[:, :, 1] >= thr) & (arr[:, :, 2] >= thr)
+
+    # Build alpha: 0 for background, 255 for subject
+    alpha = np.where(bg, 0, 255).astype(np.uint8)
+    alpha_img = Image.fromarray(alpha, mode="L")
+
+    # Soften edges if requested
+    if soften > 0:
+        alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(radius=soften))
+
+    rgba = img.convert("RGBA")
+    rgba.putalpha(alpha_img)
+    return rgba
+
+def place_on_canvas(subject_rgba: Image.Image, canvas_size=2000, scale=0.72) -> Image.Image:
+    # Crop to non-transparent bbox to avoid huge empty margins
+    bbox = subject_rgba.getbbox()
+    if bbox:
+        subject_rgba = subject_rgba.crop(bbox)
+
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+
+    # Fit subject into target box (scale of canvas)
+    target = int(canvas_size * scale)
+    w, h = subject_rgba.size
+    if w == 0 or h == 0:
+        return canvas
+
+    ratio = min(target / w, target / h)
+    new_w = max(1, int(w * ratio))
+    new_h = max(1, int(h * ratio))
+    subject_resized = subject_rgba.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Center on canvas
+    x = (canvas_size - new_w) // 2
+    y = (canvas_size - new_h) // 2
+    canvas.alpha_composite(subject_resized, (x, y))
+    return canvas
+
+if not uploaded:
     st.info("Carica una foto per iniziare.")
+    st.stop()
+
+img_in = Image.open(uploaded)
+
+# Preview input
+st.image(img_in, caption="Input", use_container_width=True)
+
+# Process
+subject = cutout_white_bg_pillow(img_in, threshold, soft)
+final_img = place_on_canvas(subject, canvas_size=2000, scale=0.72)
+
+st.image(final_img, caption="Output (PNG trasparente 2000×2000)", use_container_width=True)
+
+def safe_name(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("/", "-").replace("\\", "-")
+    return "".join(ch for ch in s if ch.isalnum() or ch in " -_").strip().replace(" ", "_")
+
+filename_parts = [safe_name(brand), safe_name(prodotto), safe_name(anno)]
+filename_parts = [p for p in filename_parts if p]
+out_name = "vinitud-cutout.png" if not filename_parts else "-".join(filename_parts) + "-transparent-2000.png"
+out_path = OUTPUT_DIR / out_name
+
+# Save + download
+final_img.save(out_path, format="PNG")
+
+with open(out_path, "rb") as f:
+    st.download_button(
+        "⬇️ Scarica PNG",
+        data=f,
+        file_name=out_name,
+        mime="image/png"
+    )
+
+st.caption(f"Salvato anche in: {out_path}")
